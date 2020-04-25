@@ -512,6 +512,7 @@ type ExecutionTuple struct { // TODO rename
 	esIndex      int
 	sequence     ExecutionSegmentSequence
 	offsetsCache [][]int64
+	jumpsCache   [][]int64
 	lcd          int64
 	// TODO discuss if we just don't want to fillCache in the constructor and not need to use pointer receivers everywhere
 	once *sync.Once
@@ -584,21 +585,32 @@ func (et *ExecutionTuple) ScaleInt64(value int64) int64 {
 		return value
 	}
 	et.once.Do(et.fillCache)
-	offsets := et.offsetsCache[et.esIndex]
-	return scaleInt64(value, offsets[0], offsets[1:], et.lcd)
+	jumps := et.jumpsCache[et.esIndex]
+	return scaleInt64(value, jumps, et.lcd)
 }
 
 // scaleInt64With scales the provided value based on the ExecutionTuples'
 // sequence and the segment provided
 func (et *ExecutionTuple) scaleInt64With(value int64, es *ExecutionSegment) int64 { //nolint:unused
-	start, offsets, lcd := et.GetStripedOffsets(es)
-	return scaleInt64(value, start, offsets, lcd)
+	jumps, lcd := et.GetStripedJumps(es)
+	return scaleInt64(value, jumps, lcd)
 }
 
-func scaleInt64(value, start int64, offsets []int64, lcd int64) int64 {
-	endValue := (value / lcd) * int64(len(offsets))
-	for gi, i := 0, start; i < value%lcd; gi, i = gi+1, i+offsets[gi] {
-		endValue++
+func scaleInt64(value int64, jumps []int64, lcd int64) int64 {
+	endValue := (value / lcd) * int64(len(jumps))
+	remaining := value % lcd
+	if jumps[0] <= remaining {
+		i, j := 0, len(jumps)
+		for i < j {
+			h := int(uint(i+j) >> 1) // avoid overflow when computing h
+			// i ≤ h < j
+			if jumps[h] < remaining {
+				i = h + 1 // preserves f(i-1) == false
+			} else {
+				j = h // preserves f(j) == true
+			}
+		}
+		endValue += int64(i)
 	}
 	return endValue
 }
@@ -607,13 +619,16 @@ func (et *ExecutionTuple) fillCache() {
 	var wrapper = newWrapper(et.sequence)
 
 	et.offsetsCache = make([][]int64, len(et.sequence))
+	et.jumpsCache = make([][]int64, len(et.sequence))
 	for i := range et.offsetsCache {
 		et.offsetsCache[i] = make([]int64, 0, wrapper.slice[i].numerator+1)
+		et.jumpsCache[i] = make([]int64, 0, wrapper.slice[i].numerator)
 	}
 
 	var prev = make([]int64, len(et.sequence))
 	var saveIndex = func(iteration int64, index int, numerator int64) bool {
 		et.offsetsCache[index] = append(et.offsetsCache[index], iteration-prev[index])
+		et.jumpsCache[index] = append(et.jumpsCache[index], iteration)
 		prev[index] = iteration
 		if int64(len(et.offsetsCache[index])) == numerator {
 			et.offsetsCache[index] = append(et.offsetsCache[index], et.offsetsCache[index][0]+wrapper.lcd-iteration)
@@ -643,6 +658,18 @@ func (et *ExecutionTuple) GetStripedOffsets(segment *ExecutionSegment) (int64, [
 	return offsets[0], offsets[1:], et.lcd
 }
 
+// GetStrippedJumps same as GetStrippedOffsets but the offsets array is the actual jump from the
+// begining of the cycle instead of from the previous value
+func (et *ExecutionTuple) GetStripedJumps(segment *ExecutionSegment) ([]int64, int64) {
+	et.once.Do(et.fillCache)
+	index := et.find(segment)
+	if index == -1 {
+		return nil, et.lcd
+	}
+	jumps := et.jumpsCache[index]
+	return jumps, et.lcd
+}
+
 // GetNewExecutionTupleBasedOnValue uses the value provided, splits it using the striping offsets
 // between all the segments in the sequence and returns a new ExecutionTuple with a new sequence and
 // segments, such that each new segment in the new sequence has length `Scale(value)/value` while
@@ -658,8 +685,8 @@ func (et *ExecutionTuple) GetNewExecutionTupleBasedOnValue(value int64) *Executi
 	et.once.Do(et.fillCache)
 	var prev int64
 	for i := range et.sequence {
-		offsets := et.offsetsCache[i]
-		newValue := scaleInt64(value, offsets[0], offsets[1:], et.lcd)
+		jumps := et.jumpsCache[i]
+		newValue := scaleInt64(value, jumps, et.lcd)
 		if newValue == 0 {
 			continue
 		}
